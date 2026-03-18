@@ -26,7 +26,7 @@ jobs:
         run: |
           set +e
           dotnet test --no-build --configuration Release -q 2>&1 | tee test.log
-          EXIT_CODE=$?
+          EXIT_CODE=${PIPESTATUS[0]}
           if [ $EXIT_CODE -ne 0 ]; then
             echo "tests_failed=true" >> $GITHUB_OUTPUT
           else
@@ -76,39 +76,79 @@ jobs:
           dotnet test --no-build -q 2>&1 | tee test.log
           exit 0
 
-      - name: Install Node.js
-        uses: actions/setup-node@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          node-version: '20'
+          python-version: '3.12'
 
-      - name: Install Codex CLI
-        run: npm install -g @openai/codex
+      - name: Install openai SDK
+        run: pip install openai
 
-      - name: Run Codex auto-fix
+      - name: Run AI auto-fix
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
-          PROMPT=$(cat .codex/commands/fix-tests.md)
-          TEST_FAILURES=$(cat test.log)
-          codex --approval-mode full-auto \
-            --model o4-mini \
-            "$PROMPT
+          python3 - <<'PYEOF'
+          import os, json, re
+          from openai import OpenAI
+
+          client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+
+          prompt_text = open(".codex/commands/fix-tests.md").read()
+          test_failures = open("test.log").read()
+          source_code   = open("src/MathUtils/MathCalculator.cs").read()
+
+          system_msg = (
+              "You are a C# expert. Fix ONLY the source file src/MathUtils/MathCalculator.cs "
+              "so all tests pass. Do NOT modify any test files. "
+              "Return ONLY a fenced code block with the corrected C# file content."
+          )
+          user_msg = f"""{prompt_text}
 
           ## Current Test Failures
-          \`\`\`
-          $TEST_FAILURES
-          \`\`\`
-          "
+          ```
+          {test_failures}
+          ```
+
+          ## Source File: src/MathUtils/MathCalculator.cs
+          ```csharp
+          {source_code}
+          ```
+          """
+
+          response = client.chat.completions.create(
+              model="gpt-4o-mini",
+              messages=[
+                  {"role": "system", "content": system_msg},
+                  {"role": "user",   "content": user_msg},
+              ],
+              max_tokens=1500,
+          )
+
+          reply = response.choices[0].message.content
+          print("=== AI response ===")
+          print(reply)
+
+          # Extract code from fenced block
+          match = re.search(r"```(?:csharp|cs)?\n(.*?)```", reply, re.DOTALL)
+          if not match:
+              raise RuntimeError("AI did not return a fenced code block")
+
+          fixed = match.group(1)
+          with open("src/MathUtils/MathCalculator.cs", "w") as f:
+              f.write(fixed)
+          print("=== Fixed file written ===")
+          PYEOF
 
       - name: Re-run tests (must be green)
-        run: dotnet test --no-build -q
+        run: dotnet test --verbosity quiet
 
       - name: Commit & push fix
         run: |
           git config user.name "codex-autofix-bot"
           git config user.email "codex-autofix-bot@users.noreply.github.com"
           git add -A
-          git commit -m "autofix: make CI green via Codex [skip ci]" || echo "Nothing to commit"
+          git commit -m "autofix: make CI green via Codex" || echo "Nothing to commit"
           git push origin HEAD:${{ github.ref_name }}
 
       - name: Create PR if one does not exist
@@ -131,3 +171,61 @@ jobs:
           else
             echo "PR #$EXISTING already exists — patch pushed to branch."
           fi
+
+      - name: Re-grade after autofix
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH="${{ github.ref_name }}"
+          PR=$(gh pr list --head "$BRANCH" --base main --json number --jq '.[0].number' 2>/dev/null || echo "")
+          if [ -z "$PR" ]; then echo "No PR found, skipping grade."; exit 0; fi
+
+          # Tests already passed (previous step succeeded)
+          TEST_CODE=0
+
+          # Diff stats — only the Codex fix commit (HEAD vs HEAD^)
+          CODEX_FILES=$(git diff --name-only HEAD^ HEAD | grep -v '^$' | tr '\n' ' ')
+          CODEX_LINES_ADD=$(git diff --shortstat HEAD^ HEAD | grep -oP '\d+(?= insertion)' || echo 0)
+          CODEX_LINES_DEL=$(git diff --shortstat HEAD^ HEAD | grep -oP '\d+(?= deletion)' || echo 0)
+          CODEX_LINES=$(( ${CODEX_LINES_ADD:-0} + ${CODEX_LINES_DEL:-0} ))
+          CODEX_FILE_COUNT=$(git diff --name-only HEAD^ HEAD | grep -c '.')
+
+          # Tests changed?
+          if git diff --name-only HEAD^ HEAD | grep -q "tests/"; then
+            TESTS_CHANGED=1
+          else
+            TESTS_CHANGED=0
+          fi
+
+          # Score
+          SCORE=0
+          [ "$TEST_CODE" = "0" ]    && SCORE=$((SCORE+6))
+          [ "$TESTS_CHANGED" = "0" ] && SCORE=$((SCORE+2))
+          [ "$CODEX_LINES" -le 80 ] && SCORE=$((SCORE+2))
+
+          if   [ $SCORE -ge 9 ]; then BADGE="🏆 Excellent"
+          elif [ $SCORE -ge 7 ]; then BADGE="✅ Good"
+          elif [ $SCORE -ge 5 ]; then BADGE="⚠️ Needs work"
+          else                        BADGE="❌ Failing"
+          fi
+
+          TESTS_ICON=$([ "$TEST_CODE" = "0" ] && echo "✅ Yes" || echo "❌ No")
+          TESTS_PTS=$([ "$TEST_CODE" = "0" ] && echo 6 || echo 0)
+          CHANGED_ICON=$([ "$TESTS_CHANGED" = "0" ] && echo "✅ Yes" || echo "❌ No")
+          CHANGED_PTS=$([ "$TESTS_CHANGED" = "0" ] && echo 2 || echo 0)
+          DIFF_ICON=$([ "$CODEX_LINES" -le 80 ] && echo "✅ Yes" || echo "❌ No")
+          DIFF_PTS=$([ "$CODEX_LINES" -le 80 ] && echo 2 || echo 0)
+
+          BODY="### 🎓 Auto-grade result — $BADGE
+          **Score: $SCORE / 10** _(graded after Codex fix)_
+
+          | Check | Result | Points |
+          |-------|--------|--------|
+          | Tests pass | $TESTS_ICON | $TESTS_PTS / 6 |
+          | Tests folder unchanged | $CHANGED_ICON | $CHANGED_PTS / 2 |
+          | Codex diff ≤ 80 lines | $CODEX_LINES lines in $CODEX_FILE_COUNT file(s) — $DIFF_ICON | $DIFF_PTS / 2 |
+
+          <sub>Codex changed: \`$CODEX_FILES\`</sub>"
+
+          gh pr comment "$PR" --edit-last --body "$BODY" 2>/dev/null || \
+          gh pr comment "$PR" --body "$BODY"
