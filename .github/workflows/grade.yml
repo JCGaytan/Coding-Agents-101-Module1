@@ -2,6 +2,7 @@ name: Grade
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened]
 
 permissions:
   contents: read
@@ -12,6 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
@@ -25,7 +28,7 @@ jobs:
         id: public
         run: |
           set +e
-          dotnet test --no-build --configuration Release -q
+          dotnet test --no-build --configuration Release --verbosity quiet
           echo "code=$?" >> $GITHUB_OUTPUT
           exit 0
 
@@ -44,12 +47,16 @@ jobs:
             echo "tests_changed=0" >> $GITHUB_OUTPUT
           fi
 
-          LINES=$(git diff --shortstat origin/${{ github.base_ref }}...HEAD | awk '{print $4}')
-          if [ -z "$LINES" ]; then LINES=0; fi
-          echo "lines=$LINES" >> $GITHUB_OUTPUT
+          LINES=$(git diff --shortstat origin/${{ github.base_ref }}...HEAD | grep -oP '\d+ insertion' | grep -oP '\d+' || echo 0)
+          LINES_DEL=$(git diff --shortstat origin/${{ github.base_ref }}...HEAD | grep -oP '\d+ deletion' | grep -oP '\d+' || echo 0)
+          TOTAL=$((${LINES:-0} + ${LINES_DEL:-0}))
+          echo "lines=$TOTAL" >> $GITHUB_OUTPUT
+
+          FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD | wc -l | tr -d ' ')
+          echo "files=$FILES" >> $GITHUB_OUTPUT
           exit 0
 
-      - name: Compute score + comment
+      - name: Compute score + upsert comment
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -63,14 +70,27 @@ jobs:
 
           # 2 pts: small diff (<= 80 changed lines)
           L="${{ steps.gates.outputs.lines }}"
+          if [ -z "$L" ]; then L=0; fi
           if [ "$L" -le 80 ]; then SCORE=$((SCORE+2)); fi
 
-          BODY="### ✅ Auto-grade result
-          Score: **$SCORE / 10**
+          if   [ $SCORE -ge 9 ]; then BADGE="🏆 Excellent"
+          elif [ $SCORE -ge 7 ]; then BADGE="✅ Good"
+          elif [ $SCORE -ge 5 ]; then BADGE="⚠️ Needs work"
+          else                        BADGE="❌ Failing"
+          fi
 
-          - Public tests exit code: **${{ steps.public.outputs.code }}** (0 = pass)
-          - Tests folder modified: **${{ steps.gates.outputs.tests_changed }}** (0 = no)
-          - Approx. lines changed: **$L**
-          - Changed files: ${{ steps.gates.outputs.changed }}"
+          BODY="### 🎓 Auto-grade result — $BADGE
+          **Score: $SCORE / 10**
 
-          gh pr comment ${{ github.event.pull_request.number }} --body "$BODY"
+          | Check | Result | Points |
+          |-------|--------|--------|
+          | Tests pass | $([ '${{ steps.public.outputs.code }}' = '0' ] && echo '✅ Yes' || echo '❌ No') | $([ '${{ steps.public.outputs.code }}' = '0' ] && echo 6 || echo 0) / 6 |
+          | Tests folder unchanged | $([ '${{ steps.gates.outputs.tests_changed }}' = '0' ] && echo '✅ Yes' || echo '❌ No') | $([ '${{ steps.gates.outputs.tests_changed }}' = '0' ] && echo 2 || echo 0) / 2 |
+          | Diff ≤ 80 lines | $L lines across ${{ steps.gates.outputs.files }} file(s) | $([ '$L' -le 80 ] && echo 2 || echo 0) / 2 |
+
+          <sub>Changed files: \`${{ steps.gates.outputs.changed }}\`</sub>"
+
+          PR=${{ github.event.pull_request.number }}
+          # Update existing bot comment or create a new one
+          gh pr comment $PR --edit-last --body "$BODY" 2>/dev/null || \
+          gh pr comment $PR --body "$BODY"
