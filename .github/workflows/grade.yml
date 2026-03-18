@@ -1,0 +1,142 @@
+name: Grade PR
+
+on:
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Pull Request number to grade'
+        required: false
+        type: string
+
+permissions:
+  pull-requests: write
+  checks: write
+
+jobs:
+  grade:
+    name: Grade Submission
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore & build
+        run: dotnet restore && dotnet build --no-restore --configuration Release
+
+      - name: Run tests with detailed output
+        id: run_tests
+        run: |
+          dotnet test --no-build --configuration Release --verbosity normal \
+            --logger "trx;LogFileName=test-results.trx" 2>&1 | tee test-output.txt || true
+
+      - name: Parse test results and compute score
+        id: grade
+        run: |
+          PASSED=$(grep -oP 'Passed:\s+\K[0-9]+' test-output.txt | head -1 || echo "0")
+          FAILED=$(grep -oP 'Failed:\s+\K[0-9]+' test-output.txt | head -1 || echo "0")
+          TOTAL=$(grep -oP 'Total:\s+\K[0-9]+' test-output.txt | head -1 || echo "0")
+
+          if [ "$TOTAL" -gt "0" ]; then
+            SCORE=$(( (PASSED * 100) / TOTAL ))
+          else
+            SCORE=0
+          fi
+
+          # Bonus: check for README
+          README_BONUS=0
+          if [ -f "README.md" ] && [ $(wc -l < README.md) -gt 10 ]; then
+            README_BONUS=5
+          fi
+
+          # Bonus: check for all 3 workflows
+          WORKFLOW_BONUS=0
+          WORKFLOW_COUNT=0
+          [ -f ".github/workflows/ci.yml" ] && WORKFLOW_COUNT=$((WORKFLOW_COUNT+1))
+          [ -f ".github/workflows/codex-autofix.yml" ] && WORKFLOW_COUNT=$((WORKFLOW_COUNT+1))
+          [ -f ".github/workflows/grade.yml" ] && WORKFLOW_COUNT=$((WORKFLOW_COUNT+1))
+          [ "$WORKFLOW_COUNT" -eq "3" ] && WORKFLOW_BONUS=5
+
+          FINAL_SCORE=$((SCORE + README_BONUS + WORKFLOW_BONUS))
+          [ "$FINAL_SCORE" -gt "100" ] && FINAL_SCORE=100
+
+          if [ "$FINAL_SCORE" -ge "90" ]; then GRADE="A"
+          elif [ "$FINAL_SCORE" -ge "80" ]; then GRADE="B"
+          elif [ "$FINAL_SCORE" -ge "70" ]; then GRADE="C"
+          elif [ "$FINAL_SCORE" -ge "60" ]; then GRADE="D"
+          else GRADE="F"
+          fi
+
+          echo "passed=$PASSED" >> $GITHUB_OUTPUT
+          echo "failed=$FAILED" >> $GITHUB_OUTPUT
+          echo "total=$TOTAL" >> $GITHUB_OUTPUT
+          echo "score=$FINAL_SCORE" >> $GITHUB_OUTPUT
+          echo "grade=$GRADE" >> $GITHUB_OUTPUT
+          echo "readme_bonus=$README_BONUS" >> $GITHUB_OUTPUT
+          echo "workflow_bonus=$WORKFLOW_BONUS" >> $GITHUB_OUTPUT
+
+      - name: Post grade comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const passed = '${{ steps.grade.outputs.passed }}';
+            const failed = '${{ steps.grade.outputs.failed }}';
+            const total  = '${{ steps.grade.outputs.total }}';
+            const score  = '${{ steps.grade.outputs.score }}';
+            const grade  = '${{ steps.grade.outputs.grade }}';
+            const readmeBonus    = '${{ steps.grade.outputs.readme_bonus }}';
+            const workflowBonus  = '${{ steps.grade.outputs.workflow_bonus }}';
+
+            const emoji = grade === 'A' ? '🏆' : grade === 'B' ? '🥈' : grade === 'C' ? '🥉' : '📝';
+            const bar = '█'.repeat(Math.round(score / 10)) + '░'.repeat(10 - Math.round(score / 10));
+
+            const body = `## ${emoji} Grading Report
+
+            | Metric | Value |
+            |--------|-------|
+            | Tests Passed | ✅ ${passed} / ${total} |
+            | Tests Failed | ❌ ${failed} |
+            | Base Score   | ${Math.round((passed / total) * 100)}% |
+            | README Bonus | +${readmeBonus} pts |
+            | Workflows Bonus | +${workflowBonus} pts |
+            | **Final Score** | **${score} / 100** |
+            | **Grade** | **${grade}** |
+
+            \`Progress: [${bar}] ${score}%\`
+
+            ${failed > 0 ? '> 💡 **Tip:** Run the Codex Auto-fix workflow to automatically repair failing tests!' : '> 🎉 All tests passing! Great work!'}
+            `;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });
+
+      - name: Print grade summary
+        run: |
+          echo "==============================="
+          echo "  GRADING SUMMARY"
+          echo "==============================="
+          echo "  Passed : ${{ steps.grade.outputs.passed }} / ${{ steps.grade.outputs.total }}"
+          echo "  Failed : ${{ steps.grade.outputs.failed }}"
+          echo "  Score  : ${{ steps.grade.outputs.score }} / 100"
+          echo "  Grade  : ${{ steps.grade.outputs.grade }}"
+          echo "==============================="
+
+      - name: Fail if score below 60
+        run: |
+          SCORE=${{ steps.grade.outputs.score }}
+          if [ "$SCORE" -lt "60" ]; then
+            echo "❌ Score below 60 — submission does not meet minimum requirements."
+            exit 1
+          fi

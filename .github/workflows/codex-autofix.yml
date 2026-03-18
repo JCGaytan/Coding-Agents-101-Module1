@@ -1,0 +1,107 @@
+name: Codex Auto-fix
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Pull Request number to auto-fix'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  autofix:
+    name: Auto-fix Failing Tests with Codex
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.inputs.pr_number }}/head
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore & build
+        run: dotnet restore && dotnet build --no-restore
+
+      - name: Run tests and capture failures
+        id: run_tests
+        run: |
+          dotnet test --no-build --verbosity normal 2>&1 | tee test-output.txt || true
+          echo "test_output<<EOF" >> $GITHUB_OUTPUT
+          cat test-output.txt >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Check for failures
+        id: check_failures
+        run: |
+          if grep -q "Failed!" test-output.txt; then
+            echo "has_failures=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_failures=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Setup Node.js for Codex CLI
+        if: steps.check_failures.outputs.has_failures == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Codex CLI
+        if: steps.check_failures.outputs.has_failures == 'true'
+        run: npm install -g @openai/codex
+
+      - name: Run Codex auto-fix
+        if: steps.check_failures.outputs.has_failures == 'true'
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          PROMPT=$(cat .codex/prompts/fix-ci.prompt.md)
+          TEST_FAILURES=$(cat test-output.txt)
+          codex --approval-mode full-auto \
+            --model o4-mini \
+            "$PROMPT
+
+          ## Current Test Failures
+          \`\`\`
+          $TEST_FAILURES
+          \`\`\`
+          "
+
+      - name: Verify fix with tests
+        if: steps.check_failures.outputs.has_failures == 'true'
+        run: dotnet test --no-restore --verbosity normal
+
+      - name: Commit and push fix
+        if: steps.check_failures.outputs.has_failures == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --staged --quiet || git commit -m "fix: auto-fix failing tests via Codex [skip ci]"
+          git push origin HEAD:refs/pull/${{ github.event.inputs.pr_number }}/head
+
+      - name: Comment on PR
+        if: steps.check_failures.outputs.has_failures == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: ${{ github.event.inputs.pr_number }},
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '🤖 **Codex Auto-fix** applied a patch to fix failing tests. Please review the changes and re-run CI.'
+            });
+
+      - name: No failures found
+        if: steps.check_failures.outputs.has_failures == 'false'
+        run: echo "✅ All tests are already passing. No fix needed."
