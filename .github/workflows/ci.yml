@@ -3,7 +3,6 @@ name: CI
 on:
   pull_request:
   push:
-    branches-ignore: [ main ]
 
 jobs:
   tests:
@@ -44,8 +43,11 @@ jobs:
 
   auto-fix-on-failure:
     needs: tests
-    # Only runs on direct pushes (not PRs) when tests fail
-    if: needs.tests.outputs.tests_failed == 'true' && github.event_name == 'push'
+    # Only on direct pushes to non-main branches when tests fail
+    if: |
+      needs.tests.outputs.tests_failed == 'true' &&
+      github.event_name == 'push' &&
+      github.ref_name != 'main'
     runs-on: ubuntu-latest
 
     permissions:
