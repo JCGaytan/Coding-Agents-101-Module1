@@ -44,47 +44,88 @@ jobs:
 
   auto-fix-on-failure:
     needs: tests
-    # Only trigger on direct pushes (not PRs) when tests fail
+    # Only runs on direct pushes (not PRs) when tests fail
     if: needs.tests.outputs.tests_failed == 'true' && github.event_name == 'push'
     runs-on: ubuntu-latest
 
     permissions:
       contents: write
       pull-requests: write
-      actions: write
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore & build
+        run: dotnet restore && dotnet build --no-restore
+
+      - name: Capture test failures
+        run: |
+          set +e
+          dotnet test --no-build -q 2>&1 | tee test.log
+          exit 0
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Codex CLI
+        run: npm install -g @openai/codex
+
+      - name: Run Codex auto-fix
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          PROMPT=$(cat .codex/commands/fix-tests.md)
+          TEST_FAILURES=$(cat test.log)
+          codex --approval-mode full-auto \
+            --model o4-mini \
+            "$PROMPT
+
+          ## Current Test Failures
+          \`\`\`
+          $TEST_FAILURES
+          \`\`\`
+          "
+
+      - name: Re-run tests (must be green)
+        run: dotnet test --no-build -q
+
+      - name: Commit & push fix
+        run: |
+          git config user.name "codex-autofix-bot"
+          git config user.email "codex-autofix-bot@users.noreply.github.com"
+          git add -A
+          git commit -m "autofix: make CI green via Codex [skip ci]" || echo "Nothing to commit"
+          git push origin HEAD:${{ github.ref_name }}
 
       - name: Create PR if one does not exist
-        id: create_pr
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           BRANCH="${{ github.ref_name }}"
-
           EXISTING=$(gh pr list --head "$BRANCH" --base main --json number --jq '.[0].number' 2>/dev/null || echo "")
-
           if [ -z "$EXISTING" ]; then
             gh pr create \
               --base main \
               --head "$BRANCH" \
-              --title "fix: failing tests on \`$BRANCH\` — Codex auto-fix pending" \
-              --body "🔴 CI detected failing tests on branch \`$BRANCH\`.
+              --title "fix: Codex auto-fixed failing tests on \`$BRANCH\`" \
+              --body "🤖 CI detected failing tests and Codex has applied a patch.
 
-          Codex auto-fix has been triggered automatically and will push a patch to this branch shortly.
+          All tests should now be passing — CI will re-run automatically.
 
-          > Do **not** merge until CI is green."
-            echo "PR created for branch $BRANCH"
+          > Review the changes before merging."
+            echo "PR created for $BRANCH"
           else
-            echo "PR #$EXISTING already exists for branch $BRANCH"
+            echo "PR #$EXISTING already exists — patch pushed to branch."
           fi
-
-      - name: Trigger Codex auto-fix workflow
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh workflow run codex-autofix.yml \
-            --repo ${{ github.repository }} \
-            --field branch=${{ github.ref_name }}
-          echo "✅ Codex auto-fix triggered for branch ${{ github.ref_name }}"
