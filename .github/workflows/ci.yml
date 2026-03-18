@@ -3,11 +3,13 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [ main ]
+    branches-ignore: [ main ]
 
 jobs:
   tests:
     runs-on: ubuntu-latest
+    outputs:
+      tests_failed: ${{ steps.run_tests.outputs.tests_failed }}
 
     steps:
       - uses: actions/checkout@v4
@@ -17,14 +19,21 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      - name: Restore dependencies
-        run: dotnet restore
-
-      - name: Build
-        run: dotnet build --no-restore --configuration Release
+      - name: Restore & build
+        run: dotnet restore && dotnet build --no-restore --configuration Release
 
       - name: Run tests
-        run: dotnet test --no-build --configuration Release -q 2>&1 | tee test.log
+        id: run_tests
+        run: |
+          set +e
+          dotnet test --no-build --configuration Release -q 2>&1 | tee test.log
+          EXIT_CODE=$?
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "tests_failed=true" >> $GITHUB_OUTPUT
+          else
+            echo "tests_failed=false" >> $GITHUB_OUTPUT
+          fi
+          exit 0
 
       - name: Upload test log
         if: always()
@@ -32,3 +41,50 @@ jobs:
         with:
           name: test-log
           path: test.log
+
+  auto-fix-on-failure:
+    needs: tests
+    # Only trigger on direct pushes (not PRs) when tests fail
+    if: needs.tests.outputs.tests_failed == 'true' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create PR if one does not exist
+        id: create_pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH="${{ github.ref_name }}"
+
+          EXISTING=$(gh pr list --head "$BRANCH" --base main --json number --jq '.[0].number' 2>/dev/null || echo "")
+
+          if [ -z "$EXISTING" ]; then
+            gh pr create \
+              --base main \
+              --head "$BRANCH" \
+              --title "fix: failing tests on \`$BRANCH\` — Codex auto-fix pending" \
+              --body "🔴 CI detected failing tests on branch \`$BRANCH\`.
+
+          Codex auto-fix has been triggered automatically and will push a patch to this branch shortly.
+
+          > Do **not** merge until CI is green."
+            echo "PR created for branch $BRANCH"
+          else
+            echo "PR #$EXISTING already exists for branch $BRANCH"
+          fi
+
+      - name: Trigger Codex auto-fix workflow
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run codex-autofix.yml \
+            --repo ${{ github.repository }} \
+            --field branch=${{ github.ref_name }}
+          echo "✅ Codex auto-fix triggered for branch ${{ github.ref_name }}"
