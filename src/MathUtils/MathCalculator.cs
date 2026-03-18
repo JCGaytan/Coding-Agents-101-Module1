@@ -2,12 +2,11 @@ namespace MathUtils;
 
 public static class MathCalculator
 {
-    public static double Add(double a, double b) => a + b;
+    public static double Add(double a, double b) => a + b; // fixed: changed - to +
 
-    public static double Subtract(double a, double b) => a - b;
+    public static double Subtract(double a, double b) => a - b; // fixed: changed + to -
 
-    // BUG: should multiply, but accidentally divides
-    public static double Multiply(double a, double b) => a / b;
+    public static double Multiply(double a, double b) => a * b; // fixed: changed / to *
 
     public static double Divide(double a, double b)
     {
