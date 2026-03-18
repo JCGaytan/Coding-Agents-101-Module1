@@ -77,16 +77,16 @@ Add your OpenAI API key as a repository secret:
 
 ### Trigger
 
-1. Open a Pull Request that has failing tests.
+1. Push a branch with failing tests (e.g., `feature/break-ci`).
 2. Go to **Actions → Codex Auto-fix → Run workflow**.
-3. Enter the PR number and click **Run workflow**.
+3. Enter the **branch name** and click **Run workflow**.
 4. The workflow will:
-   - Run the tests and detect failures
-   - Call Codex with the prompt in `.codex/prompts/fix-ci.prompt.md`
-   - Apply the fix to the source code
+   - Check out the branch
+   - Run the tests and capture failures
+   - Call Codex with the prompt in `.codex/commands/fix-tests.md`
+   - Apply the fix to `src/` only
    - Verify all tests pass
-   - Push the fix as a new commit to the PR branch
-   - Comment on the PR with a summary
+   - Push the fix as a new commit to the branch
 
 ---
 
