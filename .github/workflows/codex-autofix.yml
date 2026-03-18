@@ -36,32 +36,71 @@ jobs:
           dotnet test --no-build -q 2>&1 | tee test.log
           exit 0
 
-      - name: Install Node.js
-        uses: actions/setup-node@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          node-version: "20"
+          python-version: '3.12'
 
-      - name: Install Codex CLI
-        run: npm install -g @openai/codex
+      - name: Install openai SDK
+        run: pip install openai
 
-      - name: Run Codex (non-interactive)
+      - name: Run AI auto-fix
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
-          PROMPT=$(cat .codex/commands/fix-tests.md)
-          TEST_FAILURES=$(cat test.log)
-          codex --approval-mode full-auto \
-            --model o4-mini \
-            "$PROMPT
+          python3 - <<'PYEOF'
+          import os, json, re
+          from openai import OpenAI
+
+          client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+
+          prompt_text = open(".codex/commands/fix-tests.md").read()
+          test_failures = open("test.log").read()
+          source_code   = open("src/MathUtils/MathCalculator.cs").read()
+
+          system_msg = (
+              "You are a C# expert. Fix ONLY the source file src/MathUtils/MathCalculator.cs "
+              "so all tests pass. Do NOT modify any test files. "
+              "Return ONLY a fenced code block with the corrected C# file content."
+          )
+          user_msg = f"""{prompt_text}
 
           ## Current Test Failures
-          \`\`\`
-          $TEST_FAILURES
-          \`\`\`
-          "
+          ```
+          {test_failures}
+          ```
+
+          ## Source File: src/MathUtils/MathCalculator.cs
+          ```csharp
+          {source_code}
+          ```
+          """
+
+          response = client.chat.completions.create(
+              model="gpt-4o-mini",
+              messages=[
+                  {"role": "system", "content": system_msg},
+                  {"role": "user",   "content": user_msg},
+              ],
+              max_tokens=1500,
+          )
+
+          reply = response.choices[0].message.content
+          print("=== AI response ===")
+          print(reply)
+
+          match = re.search(r"```(?:csharp|cs)?\n(.*?)```", reply, re.DOTALL)
+          if not match:
+              raise RuntimeError("AI did not return a fenced code block")
+
+          fixed = match.group(1)
+          with open("src/MathUtils/MathCalculator.cs", "w") as f:
+              f.write(fixed)
+          print("=== Fixed file written ===")
+          PYEOF
 
       - name: Re-run tests (must be green)
-        run: dotnet test --no-build -q
+        run: dotnet test --verbosity quiet
 
       - name: Commit & push fix
         run: |
